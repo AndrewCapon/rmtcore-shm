@@ -1,0 +1,609 @@
+diff --git a/arch/arm64/boot/dts/freescale/imx8mp-frdm.dts b/arch/arm64/boot/dts/freescale/imx8mp-frdm.dts
+index d05cc2cfb8c4..72d3d7254ea0 100644
+--- a/arch/arm64/boot/dts/freescale/imx8mp-frdm.dts
++++ b/arch/arm64/boot/dts/freescale/imx8mp-frdm.dts
+@@ -289,6 +289,11 @@ usb3_data_ss: endpoint {
+ 			};
+ 		};
+ 	};
++
++	rmtcore_shm {
++		compatible = "fsl,rmtcore-shm";
++		status = "ok";
++	};
+ };
+ 
+ &A53_0 {
+diff --git a/drivers/mxc/Kconfig b/drivers/mxc/Kconfig
+index 293c0533ee0f..1adde8ac632e 100644
+--- a/drivers/mxc/Kconfig
++++ b/drivers/mxc/Kconfig
+@@ -23,6 +23,7 @@ source "drivers/mxc/mlb/Kconfig"
+ source "drivers/mxc/ipu3/Kconfig"
+ source "drivers/mxc/hdmi-cec/Kconfig"
+ source "drivers/mxc/mipi/Kconfig"
++source "drivers/mxc/rmtcore_shm/Kconfig"
+ 
+ # drivers common to MXC and MX8 go here:
+ 
+diff --git a/drivers/mxc/Makefile b/drivers/mxc/Makefile
+index f9ed7d8e026c..c06928a9b82b 100644
+--- a/drivers/mxc/Makefile
++++ b/drivers/mxc/Makefile
+@@ -10,3 +10,4 @@ obj-$(CONFIG_MXC_HANTRO_VC8000E) += hantro_vc8000e/
+ obj-$(CONFIG_MXC_HANTRO_V4L2) += hantro_v4l2/
+ obj-y += vpu/
+ obj-$(CONFIG_MXC_MIPI_CSI2) += mipi/
++obj-$(CONFIG_REMOTE_CORE_SHARE_MEM) += rmtcore_shm/
+diff --git a/drivers/mxc/rmtcore_shm/Kconfig b/drivers/mxc/rmtcore_shm/Kconfig
+new file mode 100644
+index 000000000000..eeb957c1ed77
+--- /dev/null
++++ b/drivers/mxc/rmtcore_shm/Kconfig
+@@ -0,0 +1,13 @@
++#
++# Remote core share memory configuration
++#
++
++menu "Remote Core Share Memory Driver"
++
++config REMOTE_CORE_SHARE_MEM
++    tristate "Remote Core Share Memory support"
++    default y
++ help
++ Say Y to get the Remote Core Share Memory support.
++
++endmenu
+diff --git a/drivers/mxc/rmtcore_shm/Makefile b/drivers/mxc/rmtcore_shm/Makefile
+new file mode 100644
+index 000000000000..70d1dc8cfa8d
+--- /dev/null
++++ b/drivers/mxc/rmtcore_shm/Makefile
+@@ -0,0 +1,5 @@
++#
++# Makefile for the i.MX6Q/DL MLB150 driver
++#
++
++obj-$(CONFIG_REMOTE_CORE_SHARE_MEM) += rmtcore-shm.o
+diff --git a/drivers/mxc/rmtcore_shm/rmtcore-shm.c b/drivers/mxc/rmtcore_shm/rmtcore-shm.c
+new file mode 100644
+index 000000000000..ff312181ad2c
+--- /dev/null
++++ b/drivers/mxc/rmtcore_shm/rmtcore-shm.c
+@@ -0,0 +1,473 @@
++/*
++ * Copyright (C) 2018 Freescale Semiconductor, Inc. All Rights Reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#include <linux/uaccess.h>
++
++#include <linux/cdev.h>
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/dma-mapping.h>
++#include <linux/errno.h>
++#include <linux/fs.h>
++#include <linux/genalloc.h>
++#include <linux/init.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/rmtcore_shm.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
++#include <linux/platform_device.h>
++#include <linux/poll.h>
++#include <linux/regulator/consumer.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/uaccess.h>
++#include <linux/rwsem.h>
++
++#define DRIVER_NAME "rmtcore_shm"
++#define DEVICE_NAME "rmtcore_shm"
++
++#define RMTCORE_SHARE_MEM_DEFAULT_SIZE		(1 * 1024 * 1024)
++
++struct rmtcore_shm_dev_info {
++	u8 *buf_addr_virt;
++	u32 buf_addr_phy;
++	/* Buffer size to hold data */
++	u32 buf_size;
++	/* r/w remaphore */
++	struct rw_semaphore rw_sema;
++};
++
++struct rmtcore_shm_data {
++	struct device *dev;
++	struct rmtcore_shm_dev_info *devinfo;
++	struct cdev cdev;
++	struct class *class;	/* device class */
++	dev_t devnum;
++};
++
++static int rmtcore_shm_open(struct inode *inode, struct file *filp)
++{
++	struct rmtcore_shm_data *drvdata = NULL;
++	struct rmtcore_shm_dev_info *pdevinfo = NULL;
++	void *buf_addr = NULL;
++	dma_addr_t phy_addr = 0;
++	u32 buf_size = 0;
++
++	drvdata = container_of(inode->i_cdev, struct rmtcore_shm_data, cdev);
++
++	pdevinfo = kzalloc(sizeof(struct rmtcore_shm_dev_info), GFP_KERNEL);
++	if (!pdevinfo) {
++		dev_err(drvdata->dev, "can't allocate memory failed for new device\n");
++		return -ENOMEM;
++	}
++
++	drvdata = container_of(inode->i_cdev, struct rmtcore_shm_data, cdev);
++	drvdata->devinfo = pdevinfo;
++	filp->private_data = drvdata;
++
++	init_rwsem(&pdevinfo->rw_sema);
++
++	buf_size = RMTCORE_SHARE_MEM_DEFAULT_SIZE;
++	buf_addr = dma_alloc_coherent(drvdata->dev, buf_size, &phy_addr, GFP_KERNEL);
++	if (!buf_addr) {
++		dev_err(drvdata->dev, "can not alloc default dma coherent buffer: %d\n", buf_size);
++		return -ENOMEM;
++	}
++	memset(buf_addr, 0, buf_size);
++	pdevinfo->buf_addr_virt = buf_addr;
++	pdevinfo->buf_addr_phy  = phy_addr;
++	pdevinfo->buf_size      = buf_size;
++
++	return 0;
++}
++
++
++static int rmtcore_shm_release(struct inode *inode, struct file *filp)
++{
++	struct rmtcore_shm_data *drvdata = filp->private_data;
++	struct rmtcore_shm_dev_info *pdevinfo = drvdata->devinfo;
++	void  *buf_addr = NULL;
++	dma_addr_t phy_addr = 0;
++
++	dev_dbg(drvdata->dev, "%s\n", __func__);
++	buf_addr = pdevinfo->buf_addr_virt;
++	phy_addr = pdevinfo->buf_addr_phy;
++	if (buf_addr && phy_addr) {
++		dev_dbg(drvdata->dev, "free dma buffer\n");
++		dma_free_coherent(drvdata->dev, pdevinfo->buf_size, buf_addr, phy_addr);
++	}
++	pdevinfo->buf_addr_virt = NULL;
++	pdevinfo->buf_addr_phy  = 0;
++	pdevinfo->buf_size = 0;
++
++	kfree(pdevinfo);
++	drvdata->devinfo = NULL;
++
++	return 0;
++}
++
++static long rmtcore_shm_ioctl(struct file *filp,
++			 unsigned int cmd, unsigned long arg)
++{
++	void *buf_addr = NULL;
++	dma_addr_t phy_addr;
++	struct rmtcore_shm_data *drvdata = filp->private_data;
++	struct rmtcore_shm_dev_info *pdevinfo = drvdata->devinfo;
++	void __user *argp = (void __user *)arg;
++	u32 buf_size = 0;
++
++	buf_addr = pdevinfo->buf_addr_virt;
++	phy_addr = pdevinfo->buf_addr_phy;
++
++	switch (cmd) {
++	case RMTCORE_SHM_CHG_BUF_SIZE:
++		{
++			/* get buf size from user space */
++			dev_dbg(drvdata->dev, "copying buffer size from user space\n");
++			if (copy_from_user(&buf_size, argp, sizeof(buf_size))) {
++				dev_err(drvdata->dev, "copy buffer size from user failed\n");
++				return -EFAULT;
++			}
++
++			dev_dbg(drvdata->dev,
++					"allocating %d bytes memory from cma area\n", (s32)buf_size);
++
++			buf_addr = pdevinfo->buf_addr_virt;
++			phy_addr = pdevinfo->buf_addr_phy;
++			if (pdevinfo->buf_addr_virt && pdevinfo->buf_addr_phy)
++				dma_free_coherent(drvdata->dev, pdevinfo->buf_size, buf_addr, phy_addr);
++			buf_addr = dma_alloc_coherent(drvdata->dev, buf_size, &phy_addr, GFP_KERNEL);
++			if (!buf_addr) {
++				dev_err(drvdata->dev, "can not alloc dma coherent buffer: %d\n", (s32)buf_size);
++				return -ENOMEM;
++			}
++			memset(buf_addr, 0, buf_size);
++			pdevinfo->buf_addr_virt = buf_addr;
++			pdevinfo->buf_addr_phy  = phy_addr;
++			pdevinfo->buf_size      = buf_size;
++			dev_dbg(drvdata->dev,
++					"cma buffer allocated, virt: 0x%llx, phy: 0x%llx\n", (u64)buf_addr, (u64)phy_addr);
++		}
++		break;
++	case RMTCORE_SHM_GET_BUF_ADDR_VIRT:
++		{
++			dev_dbg(drvdata->dev, "copying buffer virt 0x%llx to user space\n", (u64)buf_addr);
++			if (copy_to_user(argp, &buf_addr, sizeof(buf_addr))) {
++				dev_err(drvdata->dev, "copy buffer virt to user failed\n");
++				return -EFAULT;
++			}
++		}
++		break;
++	case RMTCORE_SHM_GET_BUF_ADDR_PHY:
++		{
++			dev_dbg(drvdata->dev, "copying buffer phy 0x%llx to user space\n", phy_addr);
++			if (copy_to_user(argp, &phy_addr, sizeof(phy_addr))) {
++				dev_err(drvdata->dev, "copy buffer phy to user failed\n");
++				return -EFAULT;
++			}
++		}
++		break;
++	case RMTCORE_SHM_GET_BUF_SIZE:
++		{
++			buf_size = pdevinfo->buf_size;
++			dev_dbg(drvdata->dev, "copying buffer size value %d to user space\n", buf_size);
++			if (copy_to_user(argp, &buf_size, sizeof(buf_size))) {
++				dev_err(drvdata->dev, "copy buffer size to user failed\n");
++				return -EFAULT;
++			}
++		}
++		break;
++	default:
++		{
++			dev_err(drvdata->dev, "invalid option: %d\n", cmd);
++		}
++	}
++	return (long)0;
++}
++
++static ssize_t rmtcore_shm_read(struct file *filp, char __user *buf,
++			    size_t count, loff_t *f_pos)
++{
++	struct rmtcore_shm_data *drvdata = filp->private_data;
++	struct rmtcore_shm_dev_info *pdevinfo = drvdata->devinfo;
++	void *buf_addr = NULL;
++
++	dev_dbg(drvdata->dev, "%s\n", __func__);
++	if (!pdevinfo->buf_addr_virt || !pdevinfo->buf_addr_phy) {
++		dev_err(drvdata->dev, "rmtcore_shm: need to call ioctl to allocate memory first\n");
++		return -EFAULT;
++	}
++
++	if (*f_pos >= pdevinfo->buf_size) {
++		dev_err(drvdata->dev, "rmtcore_shm: read offset exceed memory range!\n");
++		return 0;
++	}
++	if (*f_pos + count > pdevinfo->buf_size)
++		count = pdevinfo->buf_size - *f_pos;
++
++	if (!down_read_trylock(&pdevinfo->rw_sema)) {
++		dev_err(drvdata->dev, "lock failed\n");
++		return -EBUSY;
++	}
++
++	buf_addr = pdevinfo->buf_addr_virt + *f_pos;
++	dev_dbg(drvdata->dev, "copying data from buffer to user 0x%llx\n", (u64)(buf_addr + *f_pos));
++	if (copy_to_user(buf, buf_addr, count)) {
++		up_read(&pdevinfo->rw_sema);
++		dev_err(drvdata->dev, "rmtcore_shm: copy to user failed\n");
++		return -EFAULT;
++	}
++
++	//*f_pos += count;
++	up_read(&pdevinfo->rw_sema);
++	return count;
++}
++
++static ssize_t rmtcore_shm_write(struct file *filp, const char __user *buf,
++			     size_t count, loff_t *f_pos)
++{
++	s32 ret = 0;
++	void *buf_addr = NULL;
++	struct rmtcore_shm_data *drvdata = filp->private_data;
++	struct rmtcore_shm_dev_info *pdevinfo = drvdata->devinfo;
++
++	dev_dbg(drvdata->dev, "%s\n", __func__);
++	if (!pdevinfo->buf_addr_virt || !pdevinfo->buf_addr_phy) {
++		dev_err(drvdata->dev, "rmtcore_shm: need to call ioctl to allocate memory first\n");
++		return -EFAULT;
++	}
++
++	if (*f_pos >= pdevinfo->buf_size) {
++		dev_err(drvdata->dev, "file pos overflow\n");
++		goto out;
++	}
++	if (*f_pos + count > pdevinfo->buf_size) {
++		dev_err(drvdata->dev, "overflow write data\n");
++		return -EFBIG;
++	}
++
++	if (!down_write_trylock(&pdevinfo->rw_sema)) {
++		dev_err(drvdata->dev, "lock failed\n");
++		return -EBUSY;
++	}
++	
++	buf_addr = pdevinfo->buf_addr_virt + *f_pos;
++	dev_dbg(drvdata->dev, "copying data from user to buffer: 0x%llx\n", (u64)(buf_addr + *f_pos));
++	if (copy_from_user(buf_addr, buf, count)) {
++		up_write(&pdevinfo->rw_sema);
++		dev_err(drvdata->dev, "rmtcore_shm: copy from user failed\n");
++		ret = -EFAULT;
++		goto out;
++	}
++
++	//*f_pos += count;
++	up_write(&pdevinfo->rw_sema);
++	ret = count;
++out:
++	return ret;
++}
++
++static loff_t rmtcore_shm_llseek(struct file *filp, loff_t off, int whence)
++{
++	struct rmtcore_shm_data *drvdata = filp->private_data;
++	struct rmtcore_shm_dev_info *pdevinfo = drvdata->devinfo;
++	loff_t newpos;
++
++	if (!pdevinfo->buf_addr_virt || !pdevinfo->buf_addr_phy) {
++		dev_err(drvdata->dev, "rmtcore_shm: need to call ioctl to allocate memory first\n");
++		return -EFAULT;
++	}
++
++	switch (whence) {
++	case 0:
++		newpos = off;
++		break;
++	case 1: /* SEEK_SET */
++		newpos = filp->f_pos + off;
++		break;
++	case 2: /* SEEK_CUR */
++		newpos = pdevinfo->buf_size - 1;
++		break;
++	default: /* SEEK_END */
++		return -EINVAL;
++	}
++
++	if (newpos >= pdevinfo->buf_size) {
++		dev_err(drvdata->dev, "rmtcore_shm: postion exceed memory space!\n");
++		return -ENOMEM;
++	}
++
++	return newpos;
++}
++
++/*
++ * char dev file operations structure
++ */
++static const struct file_operations rmtcore_shm_fops = {
++
++	.owner = THIS_MODULE,
++	.llseek = rmtcore_shm_llseek,
++	.open = rmtcore_shm_open,
++	.release = rmtcore_shm_release,
++	.unlocked_ioctl = rmtcore_shm_ioctl,
++	.read = rmtcore_shm_read,
++	.write = rmtcore_shm_write,
++};
++
++static const struct of_device_id rmtcore_shm_dt_ids[] = {
++	{
++		.compatible = "fsl,rmtcore_shm",
++	},
++	{
++	  /* sentinel */
++	}
++};
++MODULE_DEVICE_TABLE(of, rmtcore_shm_dt_ids);
++
++
++static int rmtcore_shm_probe(struct platform_device *pdev)
++{
++	int ret, rmtcore_shm_major;
++	struct rmtcore_shm_data *drvdata;
++	struct device *class_dev;
++
++	drvdata = kzalloc(sizeof(struct rmtcore_shm_data), GFP_KERNEL);
++	if (!drvdata) {
++		dev_err(&pdev->dev, "can't allocate enough memory\n");
++		return -ENOMEM;
++	}
++
++	drvdata->dev = &pdev->dev;
++	ret = alloc_chrdev_region(&drvdata->devnum, 0, 1, "rmtcore_shm");
++	if (ret < 0) {
++		dev_err(&pdev->dev, "alloc region error\n");
++		goto err_reg;
++	}
++	rmtcore_shm_major = MAJOR(drvdata->devnum);
++	dev_dbg(&pdev->dev, "RMTCORE_SHM device major: %d\n", rmtcore_shm_major);
++
++	cdev_init(&drvdata->cdev, &rmtcore_shm_fops);
++	drvdata->cdev.owner = THIS_MODULE;
++
++	ret = cdev_add(&drvdata->cdev, drvdata->devnum, 1);
++	if (ret) {
++		dev_err(&pdev->dev, "can't add cdev\n");
++		goto err_reg;
++	}
++
++	/* create class and device for udev information */
++//	drvdata->class = class_create(THIS_MODULE, DEVICE_NAME);
++	drvdata->class = class_create(DEVICE_NAME);
++	if (IS_ERR(drvdata->class)) {
++		dev_err(&pdev->dev, "failed to create device class\n");
++		ret = -ENOMEM;
++		goto err_class;
++	}
++
++	class_dev = device_create(drvdata->class, NULL, MKDEV(rmtcore_shm_major, 0),
++				NULL, DEVICE_NAME);
++	if (IS_ERR(class_dev)) {
++		dev_err(&pdev->dev, "failed to create rmtcore_shm %s"
++				" class device\n", DEVICE_NAME);
++		ret = -ENOMEM;
++		goto err_dev;
++	}
++
++#if 0
++	/* ioremap from phy mem to kernel space */
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res) {
++		dev_err(&pdev->dev, "can't get device resources\n");
++		ret = -ENOENT;
++		goto err_dev;
++	}
++	shm_base = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(shm_base)) {
++		dev_err(&pdev->dev,
++			"failed to get ioremap base\n");
++		ret = PTR_ERR(mlb_base);
++		goto err_dev;
++	}
++	drvdata->membase = shm_base;
++#endif
++
++	drvdata->devinfo = NULL;
++	platform_set_drvdata(pdev, drvdata);
++	return 0;
++
++err_dev:
++	device_destroy(drvdata->class, MKDEV(rmtcore_shm_major, 0));
++	class_destroy(drvdata->class);
++err_class:
++	cdev_del(&drvdata->cdev);
++err_reg:
++	unregister_chrdev_region(drvdata->devnum, 1);
++
++	return ret;
++}
++
++static void rmtcore_shm_remove(struct platform_device *pdev)
++{
++	struct rmtcore_shm_data *drvdata = platform_get_drvdata(pdev);
++
++	/* destroy device class */
++	device_destroy(drvdata->class, MKDEV(MAJOR(drvdata->devnum), 0));
++	class_destroy(drvdata->class);
++
++	cdev_del(&drvdata->cdev);
++
++	/* Unregister the devices */
++	unregister_chrdev_region(drvdata->devnum, 1);
++
++	kfree(drvdata);
++}
++
++/*
++ * platform driver structure
++ */
++static struct platform_driver rmtcore_shm_driver = {
++	.driver = {
++		.owner  = THIS_MODULE,
++		.name = DRIVER_NAME,
++		.of_match_table = rmtcore_shm_dt_ids,
++	},
++	.probe = rmtcore_shm_probe,
++	.remove = rmtcore_shm_remove
++};
++
++static int __init rmtcore_shm_init(void)
++{
++	return platform_driver_register(&rmtcore_shm_driver);
++}
++
++static void __exit rmtcore_shm_exit(void)
++{
++	platform_driver_unregister(&rmtcore_shm_driver);
++}
++
++module_init(rmtcore_shm_init);
++module_exit(rmtcore_shm_exit);
++
++MODULE_DESCRIPTION("Remote Core Shared Memory driver");
++MODULE_AUTHOR("Terry Lv, NXP");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("platform:" DRIVER_NAME);
+diff --git a/include/linux/rmtcore_shm.h b/include/linux/rmtcore_shm.h
+new file mode 100644
+index 000000000000..f677b7898269
+--- /dev/null
++++ b/include/linux/rmtcore_shm.h
+@@ -0,0 +1,25 @@
++/*
++ * mxc_mlb.h
++ *
++ * Copyright 2008-2013 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++#ifndef _RMTCORE_SHM_H
++#define _RMTCORE_SHM_H
++
++/* Change buffer size */
++#define RMTCORE_SHM_CHG_BUF_SIZE		_IOW('S', 0x1, unsigned long)
++#define RMTCORE_SHM_GET_BUF_ADDR_VIRT	_IOR('S', 0x2, unsigned long long)
++#define RMTCORE_SHM_GET_BUF_ADDR_PHY	_IOR('S', 0x3, unsigned long long)
++#define RMTCORE_SHM_GET_BUF_SIZE		_IOR('S', 0x4, unsigned long)
++
++#endif	/* _RMTCORE_SHM_H */
+\ No newline at end of file
+diff --git a/include/uapi/linux/rmtcore_shm.h b/include/uapi/linux/rmtcore_shm.h
+new file mode 100644
+index 000000000000..94abdfbca2ad
+--- /dev/null
++++ b/include/uapi/linux/rmtcore_shm.h
+@@ -0,0 +1,25 @@
++/*
++ * mxc_mlb.h
++ *
++ * Copyright 2008-2013 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++#ifndef _RMTCORE_SHM_H
++#define _RMTCORE_SHM_H
++
++/* Change buffer size */
++#define RMTCORE_SHM_CHG_BUF_SIZE		_IOW('S', 0x1, unsigned long)
++#define RMTCORE_SHM_GET_BUF_ADDR_VIRT	_IOR('S', 0x2, unsigned long long)
++#define RMTCORE_SHM_GET_BUF_ADDR_PHY	_IOR('S', 0x3, unsigned long long)
++#define RMTCORE_SHM_GET_BUF_SIZE		_IOR('S', 0x4, unsigned long)
++
++#endif	/* _RMTCORE_SHM_H */
